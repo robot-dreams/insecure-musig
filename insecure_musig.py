@@ -5,108 +5,114 @@ from insecure_musig_reference import *
 from reference import *
 from util import *
 
+# 256 concurrent signing sessions, one session per bit
+k_max = 256
+
+def gen_signer_even_y():
+    while True:
+        signer = InsecureMuSigSigner()
+        x = int_from_bytes(signer.seckey)
+        P = point_mul(G, x)
+        if has_even_y(P):
+            return signer
+
+def gen_nonce_even_y():
+    while True:
+        r, R = nonce_gen()
+        if has_even_y(pointc(R)):
+            return r, R
+
 def forge_signature(honest_signer, honest_msg, forged_msg):
     X1 = honest_signer.get_pubkey()
 
     # Force even y coordinate in both adversary pubkey and aggregate pubkey
     while True:
-        adversary = InsecureMuSigSigner()
-        P = point_mul(G, int_from_bytes(adversary.seckey))
-        if not has_even_y(P):
-            continue
+        adversary = gen_signer_even_y()
         X2 = adversary.get_pubkey()
-
-        # Key aggregation
         pubkeys = [X1, X2]
         Q = key_agg_internal(pubkeys)
         if has_even_y(Q):
             break
 
-    X = key_agg(pubkeys)
-    a_1 = key_agg_coeff(pubkeys, X1)
-    a_2 = key_agg_coeff(pubkeys, X2)
+    mu_1 = key_agg_coeff(pubkeys, X1)
+    mu_2 = key_agg_coeff(pubkeys, X2)
 
-    # Target is a 256-bit value
-    k_max = 256
+    # Start k_max concurrent signing sessions
     R_1 = [None] * k_max
     for k in range(k_max):
-        print('gen_partial_pubnonce', k)
+        print('gen_partial_pubnonce: point_mul', k)
         R_1[k] = pointc(honest_signer.gen_partial_pubnonce(k))
+    print('gen_partial_pubnonce: done')
 
-    # Force even y coordinate in linear combination of honest signer's pubnonces
+    # Loop forces even y coordinate in linear combination of honest signer's pubnonces
+    # (i.e. final aggnonce used in forgery)
     while True:
-        # Two choices of attacker-controlled aggregate nonces,
-        # force even y coordinate in both
-        while True:
-            r_agg_0, R_agg_0 = nonce_gen()
-            r_agg_1, R_agg_1 = nonce_gen()
-            if has_even_y(pointc(R_agg_0)) and has_even_y(pointc(R_agg_1)):
-                break
+        # Force even y coordinate in both choices of attacker-controlled
+        # aggregate nonce
+        _, R_agg_0 = gen_nonce_even_y()
+        _, R_agg_1 = gen_nonce_even_y()
 
         # Two corresponding challenges for each signing session
         c_0 = [None] * k_max
         c_1 = [None] * k_max
         for k in range(k_max):
             # BIP0340 challenge hash uses x-only pubnonces, so remove first byte of R_agg_b
-            c_0[k] = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg_0[1:] + X + honest_msg)) % n
-            c_1[k] = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg_1[1:] + X + honest_msg)) % n
-            # Only fails with negligible probability
+            c_0[k] = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg_0[1:] + bytes_from_point(Q) + honest_msg)) % n
+            c_1[k] = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg_1[1:] + bytes_from_point(Q) + honest_msg)) % n
+            # "Interpolation" fails if c_0[k] == c_1[k] but this only fails with negligible probability
             assert c_0[k] != c_1[k]
-        print("generate c_0, c_1 done")
 
-        # Coefficients in the linear combination
+        # We can set the alpha linear combination of the challenge hashes equal to
+        # any arbitrary value, just by choosing between R_agg_0 and R_agg_1 for each
+        # of the k_max individual challenges
         alpha = [None] * k_max
         for k in range(k_max):
-            # (c_1[k] - c_0[k])^(-1) mod n
+            # Modular inverse by raising to power of n - 2
             alpha[k] = pow(2, k, n) * pow(c_1[k] - c_0[k], n - 2, n) % n
-        print("generate alpha done")
 
-        # Nonce used in forgery
+        # R_star is the final aggnonce used in forgery
         R_star = infinity
         for k in range(k_max):
-            print('point_add', k)
+            print('generate R_star: point_add', k)
             R_star = point_add(R_star, point_mul(R_1[k], alpha[k]))
+
         if has_even_y(R_star):
-            print("generate R_star done")
             break
         else:
-            print("R_star has odd y, retrying")
+            print("generated R_star has odd y; retrying")
 
-    # Challenge used in forgery
-    e = int_from_bytes(tagged_hash('BIP0340/challenge', bytes_from_point(R_star) + X + forged_msg)) % n
-    print("generate e done")
+    # Challenge hash for forgery
+    e = int_from_bytes(tagged_hash('BIP0340/challenge', bytes_from_point(R_star) + bytes_from_point(Q) + forged_msg)) % n
 
     # The k-th bit of `target` determines whether the k-th partial signature
     # should use R_agg_0 or R_agg_1 as the aggregate nonce
     target = e
     for k in range(k_max):
         target = (target - alpha[k] * c_0[k]) % n
-    print("generate target done")
-    R_agg = [None] * k_max
+    R_agg_choice = [None] * k_max
     for k in range(k_max):
         if target & (1 << k) == 0:
-            R_agg[k] = R_agg_0
+            R_agg_choice[k] = R_agg_0
         else:
-            R_agg[k] = R_agg_1
+            R_agg_choice[k] = R_agg_1
 
-    # Verify coefficients from ROS attack
+    # Verify that alpha linear combination of challenge hashes for honest messages
+    # equals challenge hash for forgery
     c = 0
     for k in range(k_max):
-        e_k = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg[k][1:] + X + honest_msg)) % n
+        e_k = int_from_bytes(tagged_hash('BIP0340/challenge', R_agg_choice[k][1:] + bytes_from_point(Q) + honest_msg)) % n
         c = (c + alpha[k] * e_k) % n
     assert c == e
-    print("linear combination matches challenge on forged_msg")
 
     # Get honest signer to generate partial signatures on valid messages,
     # across different sessions
     s_1 = [None] * k_max
     for k in range(k_max):
         print('gen_partial_sig', k)
-        s_1[k] = int_from_bytes(honest_signer.gen_partial_sig(k, pubkeys, R_agg[k], honest_msg))
-    print("generate partial signatures done")
+        s_1[k] = int_from_bytes(honest_signer.gen_partial_sig(k, pubkeys, R_agg_choice[k], honest_msg))
 
-    # The linear combination of the partial signatures from the honest signer
-    # is equal to r_star + e * x_1 * a_1
+    # The alpha linear combination of the partial signatures from the honest signer
+    # is equal to r_star + e * x_1 * mu_1
     s = 0
     for k in range(k_max):
         s = (s + alpha[k] * s_1[k]) % n
@@ -114,13 +120,12 @@ def forge_signature(honest_signer, honest_msg, forged_msg):
     #pdb.set_trace()
 
     assert partial_sig_verify_internal(bytes_from_int(s), cbytes(R_star), cbytes(R_star), pubkeys, X1, forged_msg)
-    print("partial sig verify success")
+    print("partial_sig_verify successful")
 
-    # In order to convert this to a full signature, the only thing left
-    # is to add the contribution from the adversary (without changing the
-    # "aggregate nonce" R_star)
+    # Add contribution from adversary (without changing aggregate nonce R_star)
+    # to convert partial signature into full signature
     x_2 = int_from_bytes(adversary.seckey)
-    s = (s + e * x_2 * a_2) % n
+    s = (s + e * x_2 * mu_2) % n
     sig = bytes_from_point(R_star) + bytes_from_int(s)
     return pubkeys, sig
 
@@ -176,12 +181,8 @@ def test_basic():
     assert schnorr_verify(msg, agg_pubkey, sig)
 
 def test_forgery():
-    # Force even y coordinate in honest signer's pubkey for now
-    while True:
-        honest_signer = InsecureMuSigSigner()
-        P = point_mul(G, int_from_bytes(honest_signer.seckey))
-        if has_even_y(P):
-            break
+    # TODO: Handle honest signers with odd y as well
+    honest_signer = gen_signer_even_y()
     honest_msg = b'msg signed by both Alice and Bob'
     forged_msg = b'send all of Bob\'s coins to Alice'
 
@@ -191,6 +192,7 @@ def test_forgery():
 
     agg_pubkey = key_agg(pubkeys)
     assert schnorr_verify(forged_msg, agg_pubkey, sig)
+    print("schnorr_verify successful")
 
 if __name__ == '__main__':
     #test_basic()
